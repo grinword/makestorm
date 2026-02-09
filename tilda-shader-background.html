@@ -1,0 +1,384 @@
+<!--
+  Интерактивный шейдерный фон для Tilda
+  Вставьте содержимое этого файла в блок T123 (HTML-код) в Тильде.
+  Эффекты: Swirl (вихрь), ChromaFlow (хроматический поток по курсору), GrainOverlay (зернистость).
+-->
+
+<div id="shader-bg-container" style="position:fixed;inset:0;z-index:0;overflow:hidden;">
+  <canvas id="shader-bg-canvas"></canvas>
+  <div id="shader-bg-overlay"></div>
+  <div id="shader-bg-grain"></div>
+</div>
+
+<style>
+  #shader-bg-container {
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  #shader-bg-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  #shader-bg-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.20);
+    pointer-events: none;
+  }
+  #shader-bg-grain {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    mix-blend-mode: overlay;
+    opacity: 0.18;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 180px 180px;
+    animation: shader-grain-shift 0.4s steps(3) infinite;
+  }
+  @keyframes shader-grain-shift {
+    0%   { transform: translate(0, 0); }
+    33%  { transform: translate(-2px, 1px); }
+    66%  { transform: translate(1px, -2px); }
+    100% { transform: translate(0, 0); }
+  }
+</style>
+
+<script>
+(function() {
+  "use strict";
+
+  /* ───────── helpers ───────── */
+  function hexToVec3(hex) {
+    hex = hex.replace("#", "");
+    return [
+      parseInt(hex.substring(0, 2), 16) / 255,
+      parseInt(hex.substring(2, 4), 16) / 255,
+      parseInt(hex.substring(4, 6), 16) / 255
+    ];
+  }
+
+  /* ───────── config (matches the React props) ───────── */
+  var SWIRL = {
+    colorA:  hexToVec3("#1275d8"),
+    colorB:  hexToVec3("#e19136"),
+    speed:   0.8,
+    detail:  0.8,
+    blend:   50.0,
+    coarseX: 40.0, coarseY: 40.0,
+    mediumX: 40.0, mediumY: 40.0,
+    fineX:   40.0, fineY:   40.0
+  };
+
+  var CHROMA = {
+    baseColor:  hexToVec3("#0066ff"),
+    upColor:    hexToVec3("#0066ff"),
+    downColor:  hexToVec3("#d1d1d1"),
+    leftColor:  hexToVec3("#e19136"),
+    rightColor: hexToVec3("#e19136"),
+    intensity:  0.9,
+    radius:     1.8,
+    momentum:   25.0,
+    opacity:    0.97
+  };
+
+  /* ───────── GLSL sources ───────── */
+  var VERT = [
+    "precision highp float;",
+    "attribute vec2 a_position;",
+    "varying vec2 v_uv;",
+    "void main(){",
+    "  v_uv = a_position * 0.5 + 0.5;",
+    "  gl_Position = vec4(a_position, 0.0, 1.0);",
+    "}"
+  ].join("\n");
+
+  var FRAG = [
+    "precision highp float;",
+    "varying vec2 v_uv;",
+
+    "uniform float u_time;",
+    "uniform vec2  u_resolution;",
+    "uniform vec2  u_mouse;",      // normalised 0..1, smoothed
+    "uniform vec2  u_mouseVel;",   // normalised velocity, smoothed
+
+    /* swirl uniforms */
+    "uniform vec3  u_sColorA;",
+    "uniform vec3  u_sColorB;",
+    "uniform float u_sSpeed;",
+    "uniform float u_sDetail;",
+    "uniform float u_sBlend;",
+    "uniform vec2  u_sCoarse;",
+    "uniform vec2  u_sMedium;",
+    "uniform vec2  u_sFine;",
+
+    /* chroma uniforms */
+    "uniform vec3  u_cBase;",
+    "uniform vec3  u_cUp;",
+    "uniform vec3  u_cDown;",
+    "uniform vec3  u_cLeft;",
+    "uniform vec3  u_cRight;",
+    "uniform float u_cIntensity;",
+    "uniform float u_cRadius;",
+    "uniform float u_cMomentum;",
+    "uniform float u_cOpacity;",
+
+    /* --- simplex-style noise (3D) --- */
+    "vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}",
+    "vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}",
+    "vec4 perm(vec4 x){return mod289(((x*34.0)+1.0)*x);}",
+    "",
+    "float snoise(vec3 v){",
+    "  const vec2 C=vec2(1.0/6.0,1.0/3.0);",
+    "  const vec4 D=vec4(0.0,0.5,1.0,2.0);",
+    "  vec3 i=floor(v+dot(v,C.yyy));",
+    "  vec3 x0=v-i+dot(i,C.xxx);",
+    "  vec3 g=step(x0.yzx,x0.xyz);",
+    "  vec3 l=1.0-g;",
+    "  vec3 i1=min(g.xyz,l.zxy);",
+    "  vec3 i2=max(g.xyz,l.zxy);",
+    "  vec3 x1=x0-i1+C.xxx;",
+    "  vec3 x2=x0-i2+C.yyy;",
+    "  vec3 x3=x0-D.yyy;",
+    "  i=mod289(i);",
+    "  vec4 p=perm(perm(perm(",
+    "    i.z+vec4(0.0,i1.z,i2.z,1.0))",
+    "   +i.y+vec4(0.0,i1.y,i2.y,1.0))",
+    "   +i.x+vec4(0.0,i1.x,i2.x,1.0));",
+    "  float n_=1.0/7.0;",
+    "  vec3 ns=n_*D.wyz-D.xzx;",
+    "  vec4 j=p-49.0*floor(p*ns.z*ns.z);",
+    "  vec4 x_=floor(j*ns.z);",
+    "  vec4 y_=floor(j-7.0*x_);",
+    "  vec4 x=x_*ns.x+ns.yyyy;",
+    "  vec4 y=y_*ns.x+ns.yyyy;",
+    "  vec4 h=1.0-abs(x)-abs(y);",
+    "  vec4 b0=vec4(x.xy,y.xy);",
+    "  vec4 b1=vec4(x.zw,y.zw);",
+    "  vec4 s0=floor(b0)*2.0+1.0;",
+    "  vec4 s1=floor(b1)*2.0+1.0;",
+    "  vec4 sh=-step(h,vec4(0.0));",
+    "  vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;",
+    "  vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;",
+    "  vec3 p0=vec3(a0.xy,h.x);",
+    "  vec3 p1=vec3(a0.zw,h.y);",
+    "  vec3 p2=vec3(a1.xy,h.z);",
+    "  vec3 p3=vec3(a1.zw,h.w);",
+    "  vec4 norm=1.79284291400159-0.85373472095314*vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3));",
+    "  p0*=norm.x; p1*=norm.y; p2*=norm.z; p3*=norm.w;",
+    "  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0);",
+    "  m=m*m;",
+    "  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));",
+    "}",
+
+    /* --- FBM --- */
+    "float fbm(vec3 p, float detail){",
+    "  float v=0.0, a=0.5;",
+    "  for(int i=0;i<5;i++){",
+    "    v+=a*snoise(p);",
+    "    p*=2.0; a*=0.5;",
+    "    if(float(i)>=detail*5.0) break;",
+    "  }",
+    "  return v;",
+    "}",
+
+    /* --- Swirl layer --- */
+    "vec3 swirlLayer(vec2 uv, float t){",
+    "  float aspect = u_resolution.x / u_resolution.y;",
+    "  vec2 st = uv * 2.0 - 1.0;",
+    "  st.x *= aspect;",
+
+    /* coarse warp */
+    "  float n1 = snoise(vec3(st * u_sCoarse * 0.01, t * u_sSpeed * 0.4));",
+    /* medium warp */
+    "  float n2 = snoise(vec3((st + n1 * 0.3) * u_sMedium * 0.02, t * u_sSpeed * 0.6));",
+    /* fine warp */
+    "  float n3 = fbm(vec3((st + vec2(n1, n2) * 0.2) * u_sFine * 0.03, t * u_sSpeed), u_sDetail);",
+
+    "  float pattern = (n1 + n2 + n3) * 0.333;",
+    "  float mixer = smoothstep(-1.0, 1.0, pattern * u_sBlend * 0.04);",
+    "  return mix(u_sColorA, u_sColorB, mixer);",
+    "}",
+
+    /* --- ChromaFlow layer --- */
+    "vec3 chromaLayer(vec2 uv, vec3 base){",
+    "  vec2 delta = uv - u_mouse;",
+    "  float dist = length(delta);",
+    "  float falloff = 1.0 - smoothstep(0.0, u_cRadius, dist);",
+    "  falloff *= u_cIntensity;",
+
+    /* directional tint based on mouse velocity */
+    "  vec2 vel = u_mouseVel * u_cMomentum;",
+    "  vec3 dirColor = u_cBase;",
+    "  dirColor = mix(dirColor, u_cUp,    clamp( vel.y, 0.0, 1.0));",
+    "  dirColor = mix(dirColor, u_cDown,  clamp(-vel.y, 0.0, 1.0));",
+    "  dirColor = mix(dirColor, u_cLeft,  clamp(-vel.x, 0.0, 1.0));",
+    "  dirColor = mix(dirColor, u_cRight, clamp( vel.x, 0.0, 1.0));",
+
+    "  vec3 result = mix(base, dirColor, falloff);",
+    "  return mix(base, result, u_cOpacity);",
+    "}",
+
+    /* --- main --- */
+    "void main(){",
+    "  vec2 uv = v_uv;",
+    "  vec3 col = swirlLayer(uv, u_time);",
+    "  col = chromaLayer(uv, col);",
+    "  gl_FragColor = vec4(col, 1.0);",
+    "}"
+  ].join("\n");
+
+  /* ───────── bootstrap ───────── */
+  function boot() {
+    var canvas = document.getElementById("shader-bg-canvas");
+    if (!canvas) return;
+
+    var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+    if (!gl) {
+      console.warn("[shader-bg] WebGL not supported");
+      return;
+    }
+
+    /* compile helper */
+    function compile(type, src) {
+      var s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error("[shader-bg]", gl.getShaderInfoLog(s));
+        gl.deleteShader(s);
+        return null;
+      }
+      return s;
+    }
+
+    var vs = compile(gl.VERTEX_SHADER, VERT);
+    var fs = compile(gl.FRAGMENT_SHADER, FRAG);
+    if (!vs || !fs) return;
+
+    var prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.error("[shader-bg]", gl.getProgramInfoLog(prog));
+      return;
+    }
+    gl.useProgram(prog);
+
+    /* full-screen quad */
+    var buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1, -1,  1, -1,  -1, 1,
+      -1,  1,  1, -1,   1, 1
+    ]), gl.STATIC_DRAW);
+    var aPos = gl.getAttribLocation(prog, "a_position");
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    /* uniform locations */
+    var loc = {};
+    var names = [
+      "u_time", "u_resolution", "u_mouse", "u_mouseVel",
+      "u_sColorA", "u_sColorB", "u_sSpeed", "u_sDetail", "u_sBlend",
+      "u_sCoarse", "u_sMedium", "u_sFine",
+      "u_cBase", "u_cUp", "u_cDown", "u_cLeft", "u_cRight",
+      "u_cIntensity", "u_cRadius", "u_cMomentum", "u_cOpacity"
+    ];
+    for (var i = 0; i < names.length; i++) {
+      loc[names[i]] = gl.getUniformLocation(prog, names[i]);
+    }
+
+    /* set static uniforms */
+    gl.uniform3fv(loc.u_sColorA, SWIRL.colorA);
+    gl.uniform3fv(loc.u_sColorB, SWIRL.colorB);
+    gl.uniform1f(loc.u_sSpeed,  SWIRL.speed);
+    gl.uniform1f(loc.u_sDetail, SWIRL.detail);
+    gl.uniform1f(loc.u_sBlend,  SWIRL.blend);
+    gl.uniform2f(loc.u_sCoarse, SWIRL.coarseX, SWIRL.coarseY);
+    gl.uniform2f(loc.u_sMedium, SWIRL.mediumX, SWIRL.mediumY);
+    gl.uniform2f(loc.u_sFine,   SWIRL.fineX,   SWIRL.fineY);
+
+    gl.uniform3fv(loc.u_cBase,  CHROMA.baseColor);
+    gl.uniform3fv(loc.u_cUp,    CHROMA.upColor);
+    gl.uniform3fv(loc.u_cDown,  CHROMA.downColor);
+    gl.uniform3fv(loc.u_cLeft,  CHROMA.leftColor);
+    gl.uniform3fv(loc.u_cRight, CHROMA.rightColor);
+    gl.uniform1f(loc.u_cIntensity, CHROMA.intensity);
+    gl.uniform1f(loc.u_cRadius,    CHROMA.radius);
+    gl.uniform1f(loc.u_cMomentum,  CHROMA.momentum);
+    gl.uniform1f(loc.u_cOpacity,   CHROMA.opacity);
+
+    /* mouse tracking with momentum smoothing */
+    var mouse     = { x: 0.5, y: 0.5 };
+    var smoothPos = { x: 0.5, y: 0.5 };
+    var smoothVel = { x: 0.0, y: 0.0 };
+    var prevPos   = { x: 0.5, y: 0.5 };
+
+    function onMove(e) {
+      var cx, cy;
+      if (e.touches && e.touches.length) {
+        cx = e.touches[0].clientX;
+        cy = e.touches[0].clientY;
+      } else {
+        cx = e.clientX;
+        cy = e.clientY;
+      }
+      mouse.x = cx / window.innerWidth;
+      mouse.y = 1.0 - cy / window.innerHeight; // flip Y for GL
+    }
+    window.addEventListener("mousemove", onMove, { passive: true });
+    window.addEventListener("touchmove", onMove, { passive: true });
+
+    /* resize */
+    function resize() {
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      var w = canvas.clientWidth;
+      var h = canvas.clientHeight;
+      canvas.width  = w * dpr;
+      canvas.height = h * dpr;
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    /* render loop */
+    var startTime = performance.now();
+    var lerpFactor = 0.06; // lower = more inertia
+
+    function frame() {
+      var t = (performance.now() - startTime) * 0.001;
+
+      /* smooth mouse position */
+      smoothPos.x += (mouse.x - smoothPos.x) * lerpFactor;
+      smoothPos.y += (mouse.y - smoothPos.y) * lerpFactor;
+
+      /* velocity (smoothed) */
+      var rawVx = smoothPos.x - prevPos.x;
+      var rawVy = smoothPos.y - prevPos.y;
+      smoothVel.x += (rawVx - smoothVel.x) * 0.08;
+      smoothVel.y += (rawVy - smoothVel.y) * 0.08;
+      prevPos.x = smoothPos.x;
+      prevPos.y = smoothPos.y;
+
+      gl.uniform1f(loc.u_time, t);
+      gl.uniform2f(loc.u_resolution, canvas.width, canvas.height);
+      gl.uniform2f(loc.u_mouse, smoothPos.x, smoothPos.y);
+      gl.uniform2f(loc.u_mouseVel, smoothVel.x, smoothVel.y);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  /* safe init — no conflict with other Tilda scripts */
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+})();
+</script>
