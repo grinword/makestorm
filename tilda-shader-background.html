@@ -78,7 +78,7 @@
     leftColor:  hexToVec3("#e19136"),
     rightColor: hexToVec3("#e19136"),
     intensity:  0.9,
-    radius:     1.8,
+    radius:     0.32,   // localised blob radius in aspect-corrected UV
     momentum:   25.0,
     opacity:    0.97
   };
@@ -100,10 +100,9 @@
 
     "uniform float u_time;",
     "uniform vec2  u_resolution;",
-    "uniform vec2  u_mouse;",      // normalised 0..1, smoothed
-    "uniform vec2  u_mouseVel;",   // normalised velocity, smoothed
+    "uniform vec2  u_mouse;",
+    "uniform vec2  u_mouseVel;",
 
-    /* swirl uniforms */
     "uniform vec3  u_sColorA;",
     "uniform vec3  u_sColorB;",
     "uniform float u_sSpeed;",
@@ -113,7 +112,6 @@
     "uniform vec2  u_sMedium;",
     "uniform vec2  u_sFine;",
 
-    /* chroma uniforms */
     "uniform vec3  u_cBase;",
     "uniform vec3  u_cUp;",
     "uniform vec3  u_cDown;",
@@ -124,7 +122,7 @@
     "uniform float u_cMomentum;",
     "uniform float u_cOpacity;",
 
-    /* --- simplex-style noise (3D) --- */
+    /* ── simplex 3-D noise ── */
     "vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}",
     "vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}",
     "vec4 perm(vec4 x){return mod289(((x*34.0)+1.0)*x);}",
@@ -165,14 +163,17 @@
     "  vec3 p1=vec3(a0.zw,h.y);",
     "  vec3 p2=vec3(a1.xy,h.z);",
     "  vec3 p3=vec3(a1.zw,h.w);",
-    "  vec4 norm=1.79284291400159-0.85373472095314*vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3));",
+    "  vec4 norm=1.79284291400159-0.85373472095314*",
+    "    vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3));",
     "  p0*=norm.x; p1*=norm.y; p2*=norm.z; p3*=norm.w;",
-    "  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0);",
+    "  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),",
+    "    dot(x2,x2),dot(x3,x3)),0.0);",
     "  m=m*m;",
-    "  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));",
+    "  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),",
+    "    dot(p2,x2),dot(p3,x3)));",
     "}",
 
-    /* --- FBM --- */
+    /* ── FBM ── */
     "float fbm(vec3 p, float detail){",
     "  float v=0.0, a=0.5;",
     "  for(int i=0;i<5;i++){",
@@ -183,48 +184,86 @@
     "  return v;",
     "}",
 
-    /* --- Swirl layer --- */
+    /* ── Swirl — now with cursor distortion ── */
     "vec3 swirlLayer(vec2 uv, float t){",
     "  float aspect = u_resolution.x / u_resolution.y;",
     "  vec2 st = uv * 2.0 - 1.0;",
     "  st.x *= aspect;",
-
-    /* coarse warp */
-    "  float n1 = snoise(vec3(st * u_sCoarse * 0.01, t * u_sSpeed * 0.4));",
-    /* medium warp */
-    "  float n2 = snoise(vec3((st + n1 * 0.3) * u_sMedium * 0.02, t * u_sSpeed * 0.6));",
-    /* fine warp */
-    "  float n3 = fbm(vec3((st + vec2(n1, n2) * 0.2) * u_sFine * 0.03, t * u_sSpeed), u_sDetail);",
-
+    "",
+    "  vec2 mp = u_mouse * 2.0 - 1.0;",
+    "  mp.x *= aspect;",
+    "",
+    "  vec2 toMouse = st - mp;",
+    "  float mDist  = length(toMouse);",
+    /* Gaussian influence — ~0.6 radius in NDC ≈ 30 % of screen */
+    "  float warp = exp(-mDist * mDist * 4.5);",
+    "",
+    /* rotational swirl around cursor */
+    "  vec2 perp = vec2(-toMouse.y, toMouse.x);",
+    "  st += perp * warp * 0.45;",
+    /* velocity-based push */
+    "  vec2 vel = u_mouseVel * 55.0;",
+    "  st += vel * warp * 1.8;",
+    "",
+    "  float n1 = snoise(vec3(st * u_sCoarse * 0.01,",
+    "    t * u_sSpeed * 0.4));",
+    "  float n2 = snoise(vec3((st + n1 * 0.3) * u_sMedium * 0.02,",
+    "    t * u_sSpeed * 0.6));",
+    "  float n3 = fbm(vec3((st + vec2(n1, n2) * 0.2) * u_sFine * 0.03,",
+    "    t * u_sSpeed), u_sDetail);",
+    "",
     "  float pattern = (n1 + n2 + n3) * 0.333;",
     "  float mixer = smoothstep(-1.0, 1.0, pattern * u_sBlend * 0.04);",
     "  return mix(u_sColorA, u_sColorB, mixer);",
     "}",
 
-    /* --- ChromaFlow layer --- */
-    "vec3 chromaLayer(vec2 uv, vec3 base){",
-    "  vec2 delta = uv - u_mouse;",
-    "  float dist = length(delta);",
-    "  float falloff = 1.0 - smoothstep(0.0, u_cRadius, dist);",
+    /* ── ChromaFlow — localised cloud around cursor ── */
+    "vec3 chromaLayer(vec2 uv, vec3 base, float t){",
+    "  float aspect = u_resolution.x / u_resolution.y;",
+    /* aspect-corrected coordinates */
+    "  vec2 auv    = vec2(uv.x * aspect, uv.y);",
+    "  vec2 amouse = vec2(u_mouse.x * aspect, u_mouse.y);",
+    "",
+    "  vec2  delta = auv - amouse;",
+    "  float dist  = length(delta);",
+    "",
+    /* Gaussian falloff — tight blob */
+    "  float sigma2 = u_cRadius * u_cRadius;",
+    "  float falloff = exp(-dist * dist / (2.0 * sigma2));",
+    "",
+    /* noisy cloud-like edges — break up the circle */
+    "  float edgeNoise = snoise(vec3(auv * 6.0, t * 0.4)) * 0.35",
+    "                  + snoise(vec3(auv * 12.0, t * 0.7)) * 0.15;",
+    "  falloff *= smoothstep(0.0, 0.25, falloff + edgeNoise * 0.5);",
     "  falloff *= u_cIntensity;",
-
-    /* directional tint based on mouse velocity */
+    "  falloff  = clamp(falloff, 0.0, 1.0);",
+    "",
+    /* directional tint from velocity */
     "  vec2 vel = u_mouseVel * u_cMomentum;",
     "  vec3 dirColor = u_cBase;",
     "  dirColor = mix(dirColor, u_cUp,    clamp( vel.y, 0.0, 1.0));",
     "  dirColor = mix(dirColor, u_cDown,  clamp(-vel.y, 0.0, 1.0));",
     "  dirColor = mix(dirColor, u_cLeft,  clamp(-vel.x, 0.0, 1.0));",
     "  dirColor = mix(dirColor, u_cRight, clamp( vel.x, 0.0, 1.0));",
-
-    "  vec3 result = mix(base, dirColor, falloff);",
-    "  return mix(base, result, u_cOpacity);",
+    "",
+    /* slight iridescent shift at blob fringe */
+    "  float hueShift = snoise(vec3(delta * 10.0, t)) * 0.12;",
+    "  dirColor.r += hueShift;",
+    "  dirColor.b -= hueShift;",
+    "",
+    /* subtle additive glow at centre */
+    "  float glow = exp(-dist * dist / (0.6 * sigma2)) * 0.15;",
+    "  vec3 result = mix(base, dirColor, falloff * u_cOpacity);",
+    "  result += dirColor * glow;",
+    "",
+    "  return result;",
     "}",
 
-    /* --- main --- */
+    /* ── main ── */
     "void main(){",
     "  vec2 uv = v_uv;",
     "  vec3 col = swirlLayer(uv, u_time);",
-    "  col = chromaLayer(uv, col);",
+    "  col = chromaLayer(uv, col, u_time);",
     "  gl_FragColor = vec4(col, 1.0);",
     "}"
   ].join("\n");
